@@ -1,0 +1,1091 @@
+---
+title: "Projekt - Modelowanie zdarzeń ekstremalnych"
+author: "Aleksander Mackiewicz-Kubiak"
+output:
+  pdf_document: default
+---
+
+# Opis projektu 
+
+Projekt opiera się na badaniu i modelowaniu wartości ekstremalnych temperatur dla wybranej polskiej stacji meteorologicznej, oraz wybranych zależności z innymi stacjami jak i korelacji temperatury z innymi danymi meteorologicznymi. Dane do tego projektu pochodzą ze strony https://danepubliczne.imgw.pl/datastore. Moja analiza dotyczy wsi Korbielów, id 249190440, z województwa śląskiego na pograniczu z Słowacją. Pierwszą częścią projektu jest wyestymowanie na trzy sposoby 20 i 50 letniego poziomu zwrotu temperatury dla każdej z pór roku. Celem drugiej części będzie dopasowywanie i zwizualizowanie kopuł między moją stacją, a wybranymi innymi stacjami oraz analiza zmiennych z nimi powiązanych takich jak współczynnik Kendalla oraz współczynniki zalezności ekstremalnej. Celem trzeciej, ostatniej części jest badanie struktur C-vine i D-vine służących do modelowania rozkładów wielowymiarowych na podstawie czterech danych meteorologicznych dla stacji Korbielów wraz z dopasowniem modelu regresji kwantylowej.
+
+```{R include=FALSE}
+set.seed(10)
+library(tidyr)
+library(gamlss)
+library(fitdistrplus)
+library(evir)
+library(ismev)
+library(fExtremes)
+library(usefun)
+library(readxl)
+library(MASS)
+library(copula)
+library(VineCopula)
+library(ggplot2)
+library(cowplot)
+library(geosphere)
+library(vinereg)
+require(dplyr)
+library(tibble)
+library(lubridate)
+```
+
+# Część pierwsza
+
+## Przygotowanie danych
+
+Pierwszy krok to wczytanie pliku z danymi. Plik zawiera dane dla wszystkich stacji, jednak mnie interesuje tylko jedna o numerze X249190440, więc tworze osobny dataframe tylko z temperaturami z tej stacji i dla uproszczenia dalszych komend zmieniam nazwę kolumny z temperaturami na "wartosci_temp":
+
+```{R echo=FALSE}
+dane<-read.csv('C:/Users/winal/Desktop/dane R/out.csv')
+mojastacja<-as.data.frame(dane$X249190440)
+mojastacja$data<-dane$data
+colnames(mojastacja)[colnames(mojastacja) == "dane$X249190440"] <- "wartosci_temp"
+head(mojastacja)
+```
+
+Następnie tworzę kolejnego dataframe'a, tym razem z podziałem kolumny z datami na trzy osobne kolumny: rok, miesiąc i dzień:
+
+```{R echo=FALSE, warning=FALSE}
+ms <- separate(mojastacja,data,c("year","mth","day"), convert=TRUE)
+head(ms)
+```
+
+Sprawdzę teraz histogram wartości temperatur
+
+```{R echo=FALSE}
+hist(as.numeric(ms$wartosci_temp),prob=TRUE, main="Histogram wartości temperatur", 
+     xlab="Wartości temperatur", ylab="Gęstość")
+```
+
+Histogram jest dziwny, wartości temperatur sięgają do -200 stopni , co jest niemożliwe. Sortując kolumne z wartościami temperatur mozna odkryć, że istnieje pojedyczna wartość -222, która jest najprawdopodobniej błędem przy wpisywaniu:
+
+```{r echo=FALSE}
+ms[7871, ]
+```
+
+Zatem usuwam ją i ponownie sprawdzam histogram:
+
+```{R echo=FALSE}
+ms[7871, 1] = NaN
+hist(as.numeric(ms$wartosci_temp),prob=TRUE, main="Histogram wartości", 
+     xlab="Wartości temperatur", ylab="Gęstość")
+```
+
+Histogram wygląda o wiele lepiej i naturalniej. Sprawdzę jeszcze średnią, wariancje i odchylenie standardowe wartości:
+
+```{R echo=FALSE}
+print(paste("Średnia", round(mean(as.numeric(ms$wartosci_temp),na.rm=TRUE), 3), sep=" = "))
+print(paste("Wariancja", round(var(as.numeric(ms$wartosci_temp),na.rm=TRUE), 3), sep=" = "))
+print(paste("Odchylenie standardowe", round(sd(as.numeric(ms$wartosci_temp),na.rm=TRUE), 3), sep=" = "))
+```
+
+```{R include=FALSE}
+ms_wiosna<-ms[ms$mth %in% c(3,4,5),]
+ms_zima<-ms[ms$mth %in% c(1,2,12),]
+ms_lato<-ms[ms$mth %in% c(6,7,8),]
+ms_jesien<-ms[ms$mth %in% c(9,10,11),]
+ms_sezony <- list(wiosna=ms_wiosna, zima=ms_zima, lato=ms_lato, jesien=ms_jesien)
+sezony<-c("wiosna", "zima", "lato", "jesień")
+```
+
+Celem jest wyestymowanie poziomów zwrotów dla sezonów, więc podziele dane na pory roku na podstawie miesięcy:
+
+```{r echo=FALSE}
+str(ms_sezony)
+```
+
+Histogramy dla tak podzielonych danych:
+
+```{R echo=FALSE}
+par(mfrow=c(2,2))
+names <-c("wiosna", "zima", "lato", "jesien")
+mean_sezony<- sapply(ms_sezony, function(x) mean(as.numeric(x$wartosci_temp), na.rm=TRUE))
+for(i in 1:4){
+  hist(as.numeric(ms_sezony[[i]]$wartosci), prob=TRUE, main=NA, xlab="Wartości temperatur", ylab="Gęstość")
+  points(mean_sezony[i], 0, pch=19, col=2)
+  title(paste("Histogram", sezony[i], sep=" - "))}
+```
+
+## Metoda 1
+
+### Opis metody
+
+Pierwszą metodą będzie zwykłe dopasowanie rozkładów do danych z każdego sezonu. W tym celu skorzystam z pakietu gamlls, który służy właśnie do dopasowywania rozkładów do danych empirycznych i wybierze najlepiej pasujący rozkład. Ocena dopasowania rozkładu będzie przy pomocy kryterium AIC - im mniejsza wartość AIC tym lepiej dopasowany rozkład. Następnie dla tak dopasowanych rozkładów wylicze poziomy zwrotu jako kwantyle tego rozkładu, pamiętając że używane tutaj dane to nie dane roczne a 10-minutowe, co wpływa na to który kwantyl będę wyznaczać.
+
+### Analiza
+
+```{R include=FALSE}
+fitwiosna <- fitDist(ms_sezony$wiosna$wartosci_temp,type="realline")
+fitzima <- fitDist(ms_sezony$zima$wartosci_temp,type="realline")
+fitlato <- fitDist(ms_sezony$lato$wartosci_temp,type="realline")
+fitjesien <- fitDist(ms_sezony$jesien$wartosci_temp,type="realline")
+fit_list <- list(fitwiosna=fitwiosna, fitzima=fitzima, fitlato=fitlato, fitjesien=fitjesien)
+```
+
+Przy użyciu funkcji fitDist z pakietu gamlss do każdej pory roku dopasowuje najlepszy rozkład względem kryterium AIC, a następnie wszystkie wyniki zapisuje w liście. By przekonać się o odpowiednim dopasowaniu tych rozkładów, możemy je nanieść na histogramy temperatur:
+
+```{R echo=FALSE}
+par(mfrow=c(2,2))
+for(i in 1:4){
+  fit <- fit_list[[i]]
+  density_name<-fit$family[1]
+  parameters <-fit[fit$parameters]; parameters
+  
+  hist(ms_sezony[[i]]$wartosci_temp, freq=FALSE, xlab="Wartości", ylab="Gęstość", main="")
+  
+  f<-function(x) do.call(paste0("d", density_name), c(list(x), parameters))
+  curve(f(x), add=TRUE, col="blue", lwd=2)
+  title(paste("Histogram", sezony[i], sep=" - "))}
+```
+
+Po wykresach widać, że rozkłady są odpowiednie. By się jeszcze mocniej upewnić, sprawdzę wykresy Q-Q (wykresy kwantyl-kwantyl porównujące kwantyle empiryczne z danych do tych z rozkładu) dla każdej pory roku:
+
+```{R echo=FALSE}
+par(mfrow=c(2,2))
+for(i in 1:4){
+  fit <- fit_list[[i]]
+  density_name<-fit$family[1]
+  parameters <-fit[fit$parameters]; parameters
+  
+  g<-function(x) do.call(paste0("q", density_name), c(list(x), parameters))
+  alpha=ppoints(100)
+  plot(quantile(ms_sezony[[i]]$wartosci_temp,alpha,na.rm=TRUE),g(alpha), xlab="Kwantyle empiryczne", ylab="Kwantyle teoretyczne")
+  abline(a=0,b=1,col=2)}
+title("Wykresy Kwantyl-Kwantyl", line = -0.7, outer=TRUE)
+```
+
+Wszystkie cztery wykresy wychodzą wręcz perfekcyjnie. Jako finalną wizualizacje wyświetle jeszcze porównanie dystrybuanty empirycznej i teoretycznej (która patrząc na wykresy Q-Q też będzie się dobrze pokrywać):
+
+```{R echo=FALSE}
+par(mfrow=c(2,2))
+for(i in 1:4){
+  fit <- fit_list[[i]]
+  density_name<-fit$family[1]
+  parameters <-fit[fit$parameters]; parameters
+  
+  plot(ecdf(ms_sezony[[i]]$wartosci_temp), xlab="Wartości temperatury", ylab="Wartości dystrybuanty", main="")
+  h<-function(x) do.call(paste0("p", density_name), c(list(x), parameters))
+  
+  curve(h(x), xlim=c(-10,35),col=2,add=TRUE)}
+title("Wykresy dystrybuant", line=-0.7, outer=TRUE)
+```
+
+Skoro już jestem pewien dobrego dopasowania rozkładów, mogę przejść do wyliczenia poziomów zwrotu dla każdego sezonu. Chce wyznaczyć 20 i 50 letni poziom zwrotu, Moje dane jednak nie są roczne, a 10-minutowe, zatem nie mogę wziąść kwantyli 1/20 i 1/50, a potrzebuje wyliczyć ilość dni(czyli wartości) w ciągu tych lat dla każdego sezonu. Ilości dni wygladąją tak:
+
+```{R echo=FALSE}
+k_sezony<-c(wiosna=(31+30+31)*24*6, zima=(31+31+28)*24*6, lato=(30+31+31)*24*6, jesien=(30+31+30)*24*6)
+x20_sezony1 <- list()
+x50_sezony1 <- list()
+k_sezony
+```
+
+```{R include=FALSE}
+for(i in 1:4){
+  fit <- fit_list[[i]]
+  density_name<-fit$family[1]
+  parameters <-fit[fit$parameters]; parameters
+  
+  x<-function(x) do.call(paste0("q", density_name), c(x, parameters))
+  x20_sezony1<- append(x20_sezony1, x(1-1/(20*k_sezony[[i]])))
+  x50_sezony1<- append(x50_sezony1, x(1-1/(50*k_sezony[[i]])))}
+```
+
+Z metody nr 1 20 letnie poziomu zwrotu wyglądają tak:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  print(names(ms_sezony)[i])
+  print(x20_sezony1[[i]])
+  print_empty_line()}
+```
+
+A 50 letnie tak:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  print(names(ms_sezony)[i])
+  print(x50_sezony1[[i]])
+  print_empty_line()}
+```
+
+## Metoda 2
+
+### Opis metody
+
+Drugą metodą będzie metoda maksimów blokowych (ang. Block maxima method). Polega ona na podziale naszych danych na równe przedziały, np. roczne, a następnie wyznaczeniu maksimów z każdego przedziału. Zgodnie z teorią zdarzeń esktremalnych jest ograniczona ilość rozkładów jakię takie maksima mogą przyjmować oraz że istnieje rozkład GEV (ang. generalized extreme value distribution), który jest uogólnieniem wszystkich tych rozkładów. Czyli po wyznaczeniu maksimów rocznych dla danych, dopasuje je do rozkładu GEV a następnię wyznacze kwantyle 20 i 50 letniego poziomu zwrotu. Ponieważ maksima użyte do dopasowania rozkładu będą roczne, to x-letni poziom zwrotu będzie zwyczajnym kwantylem rzędu 1-1/x, czyli będą to kwantyle 0.95 i 0.98. Posłużą mi tutaj trzy pakiety: evir, ismev oraz fExtremes, które pozwolą mi dopasować rozkład GEV i go ocenić na podstawie różnych wykresów diagnostycznych (co jest ważne przy małej ilości danych na których będę tutaj operować).
+
+### Analiza
+
+```{R include=FALSE}
+x20_sezony2 <- list()
+x50_sezony2 <- list()
+k_sezony<-c(kwiosna=(31+30+31)*24*6/2, kzima=(31+31+28)*24*6, klato=(30+31+31)*24*6, kjesien=(30+31+30)*24*6)
+```
+
+Dla każdego sezonu wyznaczam maksima blokowe(roczne), a następnie dopasowuje rozkład GEV i wyświetlam jego wykresy diagnostyczne:
+
+```{r echo=FALSE}
+for(i in 1:4){
+  data <- ms_sezony[[i]]$wartosci_temp
+  data <- data[!is.na(data)]
+  fit1 <- evir::gev(data,k_sezony[[i]])
+  Max <- fit1$data
+  head(Max)}
+```
+
+
+```{r, echo=FALSE,results='hide',fig.keep='all'}
+for(i in 1:4){
+  data <- ms_sezony[[i]]$wartosci_temp
+  data <- data[!is.na(data)]
+  fit1 <- evir::gev(data,k_sezony[[i]])
+  Max <- fit1$data
+  fit2 <- ismev::gev.fit(Max)
+  ismev::gev.diag(fit2)
+  title(sezony[i], line=-0.7, outer=TRUE)}
+```
+
+Wykresy, jak na dosyć skąpą ilość danych wyglądają satysfakcjonująco. Jednak dla pewności użyje drugiego pakietu fExtremes, i tam wbudowanego podsumowania dopasowania GEV, które zawiera inne wykresy diagnostyczne:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  data <- ms_sezony[[i]]$wartosci_temp
+  data <- data[!is.na(data)]
+  
+  par(mfrow=c(1,4))
+  summary(fExtremes::gevFit(data,k_sezony[[i]]))
+  title(sezony[i], line=-0.7, outer=TRUE)} 
+```
+
+```{R include=FALSE}
+for(i in 1:4){
+  data <- ms_sezony[[i]]$wartosci_temp
+  data <- data[!is.na(data)]
+  fit1 <- evir::gev(data,k_sezony[[i]])
+  
+  x20_sezony2<- append(x20_sezony2, evir::rlevel.gev(fit1, k.blocks = 20)[1])
+  x50_sezony2<- append(x50_sezony2, evir::rlevel.gev(fit1, k.blocks = 50)[1])} 
+```
+
+Wykresy ponownie nie są idealne, ale mogły być o wiele gorsze jak na ilość danych na których tutaj operujemy. Zatem akceptuje te wykresy i jakość dopasowania rozkładu, więc pozostaje mi tylko wyliczenie progów zwrotu poprzez kwantyle dopasowanego rozkładu GEV. Z metody 2 20 letnie poziomy zwrotu prezentują się tak:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  print(names(ms_sezony)[i])
+  print(x20_sezony2[[i]])
+  print_empty_line()}
+```
+
+A 50 letnie tak:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  print(names(ms_sezony)[i])
+  print(x50_sezony2[[i]])
+  print_empty_line()}
+```
+
+## Metoda 3
+
+### Opis metody
+
+Trzecią metodą będzie metoda przekroczeń progu (ang. Peak Over Threshold). Polega ona na badaniu danych ponad pewnym progiem, i na ich podstawie wyznaczenia poziomów zwrotów. Ponownie, zgodnie z teorią zdrazeń ekstremalnych, dla odpowiednio dobranego progu dane te można modelować za pomocą rozkładu GPD (ang. generalized Pareto distribution). Zatem wpierw zajmę się wyznaczeniem odpowiedniego progu u dla każdego sezony, wyznaczeniem danych pnad tym progiem, dopasowaniem do nich rozkładu GPD i końcowo wyznaczeniem naszych kwantyli czyli poziomóW zwrotu. Ponownie, jak w przypadku metody 1, dane to maksima 10-minutowe, zatem skorzystam z takich samych rzędów kwantyli co wtedy. 
+
+### Analiza
+
+Pierwszym krokiem jest dopasowanie parametru u, który będzie progiem. Do tego potrzebujemy trzech wykresów bazujących na kwantylach 85 i 95 z oryginalnych danych. Pierwsze dwa wykresy to wykresy odpowiednio parametrów beta (modified scale) i xi (shape), a trzeci wykres to wykres średniej przekroczenia progu (Mean Excess):
+
+```{R echo=FALSE}
+for(i in 1:4){
+  data <- ms_sezony[[i]]$wartosci_temp
+  data <- data[!is.na(data)]
+  
+  qn=as.numeric(quantile(data,c(0.85,0.90,0.95)))
+  ismev::gpd.fitrange(data, qn[1], qn[3])[1]
+  title(sezony[i], line=-0.7, outer=TRUE)
+  ismev::mrl.plot(data, umin=qn[1])
+  title(sezony[i], line=-0.7, outer=TRUE)}
+```
+
+Z pierwszych dwóch wykresów szukamy takich wartości na osi x, dla których oba te wykresy są stałe. Na drugim wykresie ponownie szukamy wartości na osi x, tym razem takich dla których wykres przypomina funkcję liniową. Oba te warunki łączymy, dostając estymacje progu u. Dla moich wartości u tworzę dedykowaną listę i z wykresów odczytuje estymowane wartości:
+
+```{R echo=FALSE}
+u_lista<-list(wiosna=15,zima=6, lato=24, jesień=16); u_lista
+```
+
+Dla ustalonych wartości u możemy zwizualizować dane z zaznaczonym progiem oraz wyświetlić dane do których będziemy dopasowywać rozkład GPD, czyli wartości ponad moim progiem:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  data <- ms_sezony[[i]]$wartosci_temp
+  data <- data[!is.na(data)]
+  u<-u_lista[[i]]
+  
+  par(mfrow=c(2,1))
+  plot(data,type="h", ylab="Wartość",
+       ylim=c(mean(ms_sezony[[i]]$wartosci_temp, na.rm=TRUE)-var(ms_sezony[[i]]$wartosci_temp, na.rm=TRUE),
+       mean(ms_sezony[[i]]$wartosci_temp,na.rm=TRUE)+var(ms_sezony[[i]]$wartosci_temp, na.rm=TRUE)))
+  abline(h=u,lwd=2,col='red') 
+  
+  Y=data[data>u]-u
+  plot(Y,type='h', ylab="Wartość")
+  title(sezony[i], line=-0.7, outer=TRUE)}
+```
+
+```{R include=FALSE}
+k_sezony<-c(kwiosna=(31+30+31)*24*6, kzima=(31+31+28)*24*6, klato=(30+31+31)*24*6, kjesien=(30+31+30)*24*6)
+x20_sezony3 <- list()
+x50_sezony3 <- list()
+```
+
+Mając już zdefiniowane progi sprawdzę jakie będzie dopasowane rozkładu GPD do moich danych, przy pomocy wykresów diagnostycznych z pakietu fExtremes:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  data <- ms_sezony[[i]]$wartosci_temp
+  data <- data[!is.na(data)]
+  
+  u<-u_lista[[i]]
+  par(mfrow=c(1,4))
+  summary(fExtremes::gpdFit(data,u))
+  title(sezony[i], line=-0.7, outer=TRUE)} 
+```
+
+```{R include=FALSE}
+for(i in 1:4){
+  data <- ms_sezony[[i]]$wartosci_temp
+  data <- data[!is.na(data)]
+
+  u<-u_lista[[i]]
+  fitGPD=evir::gpd(data,u)
+  
+  x20_sezony3<- append(x20_sezony3, evir::riskmeasures(fitGPD,1-1/(20*k_sezony[[i]]))[2])
+  x50_sezony3<- append(x50_sezony3, evir::riskmeasures(fitGPD,1-1/(50*k_sezony[[i]]))[2])}
+```
+
+Wykresy są momentami dosyć niepokojące, zwłaszcza Q-Q plot momentami mocno odbiega od oczekiwanego kształtu, zatem jakość wyników przez tą metode może być niesatysfakcjonująca. Zobaczmy więc te wyniki. Do dopasowanego uoguólnionego rozkładu Pareto dla moich nadwyżek odczytuje i zapisuje interesujące mnie poziomy zwrotu. Z metody 3 20 letnie poziomy zwrotu prezentują się tak:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  print(names(ms_sezony)[i])
+  print(x20_sezony3[[i]])
+  print_empty_line()}
+```
+
+A 50 letnie tak:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  print(names(ms_sezony)[i])
+  print(x50_sezony3[[i]])
+  print_empty_line()}
+```
+
+Jak widać mimo nieidealnych dopasowań wyniki nie wydają się być skrajne lub niewłaściwe. 
+
+## Porównanie wyników części pierwszej:
+
+Mając już wyniki z użyciem trzech różnych metod możemy je porównać do siebie. Wpierw spójrzę na estymacje 20-letnich poziomów zwrotu:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  print(names(ms_sezony)[i])
+  print(x20_sezony1[[i]])
+  print(x20_sezony2[[i]])
+  print(x20_sezony3[[i]])
+  print_empty_line()}
+```
+
+Przy niektórych porach roku, takich jak lato, rozstrzał między wynikami jest względnie nieduży, bo raptem około jednego stopnia. Jednak wyniki dla jesieni są już specyficznie, bo oprócz różnicy o siedem stopni pomiędzy metodami, to jeszcze należy zauważyć, że metoda 1 pokazała tam poziom zwrotu wyższy niż w lecie, czyli cieplejszej porze roku. Ogólnie można zauważyć, że dla każdej poru roku metoda 1 daje najwyższe wyniki, a metoda 2 najniższe.\
+
+Zobaczę teraz wyniki dla 50 letniego poziomu zwrotu:
+
+```{R echo=FALSE}
+for(i in 1:4){
+  print(names(ms_sezony)[i])
+  print(x50_sezony1[[i]])
+  print(x50_sezony2[[i]])
+  print(x50_sezony3[[i]])
+  print_empty_line()}
+```
+
+Wnioski są tutaj analogiczne: metoda 1 daje najwyższe wyniki, metoda 2 daje najniższe wyniki oraz w lecie różnica między wynikami jest mała porównując ją do różnicy w jesieni. Najważniejszy jest fakt, że każda wartość tutaj wyszła większa niż przy 20 letnim poziomu zwrotu, co jest zgodne z tym, że mają to być kwantyle wyższych rzędów.
+
+# Część druga
+
+## Przygotowanie danych
+
+```{R include=FALSE}
+stacje <- read_excel('C:/Users/winal/Desktop/dane R/kody_stacji.xlsx')
+```
+
+Do tej części potrzebuje dodatkowych danych z innego pliku, zawierające indeksy stacji z zapisami temperatur, ich nazwy oraz ich współrzędne geograficzne
+
+```{r echo=FALSE}
+summary(stacje)
+```
+
+Moje dane potrzebują na wstępie kilku zmian. Wpierw zamienie zapisy temperatur z maksimów 10-minutowych na maksima dobowe, dla zmniejszego ilości danych do przetwarzania w kolejnych punktach. Oprócz tego, dla jeszcze większego zmniejszenia datasetu i upłynnienia obliczeń zredukuje ilość stacji branych pod uwagę do 30. Wybór będzie podyktowany jak najmniejszą ilościa braków w danych.
+
+```{r include=FALSE}
+maxima_dobowe <- function(dane) {
+  num_points_per_day <- 144
+  l <- length(dane) / num_points_per_day
+  dane_split <- split(dane, ceiling(seq_along(dane) / num_points_per_day))
+  wynik <- sapply(dane_split, max)
+  return(wynik)}
+```
+
+Maksima dobowe dla mojej poprzednio wybranej stacji prezentują się tak:
+
+```{r echo=FALSE, warning=FALSE}
+mojastacja1<-as.data.frame(dane$X249190440)
+mojastacja1$data<-dane$data
+mojastacja1 <- separate(mojastacja1,data,c("year","mth","day"), convert=TRUE)
+mojastacja1$data <- paste(mojastacja1$year,mojastacja1$mth, mojastacja1$day, sep="-")
+distinct_df = mojastacja1 %>% distinct(data)
+mojastacjamaxdob<-as.data.frame(maxima_dobowe(dane$X249190440))
+colnames(mojastacjamaxdob)[colnames(mojastacjamaxdob) == "maxima_dobowe(dane$X249190440)"] <- "wartosci_temp"
+mojastacjamaxdob$data <- distinct_df$data
+x1<-mojastacjamaxdob$wartosci_temp
+head(mojastacjamaxdob)
+```
+
+```{R include=FALSE}
+wybierz_kolumny <- function(df, n=31) {
+  liczba_na <- colSums(is.na(df))
+  wybrane_kolumny <- names(sort(liczba_na))[1:n]
+  return(df[, wybrane_kolumny, drop = FALSE])}
+```
+
+A lista indeksów stacji tak:
+
+```{R echo=FALSE}
+dane_x<-wybierz_kolumny(dane[, !names(dane) %in% c("X249190440")])
+colnames(dane_x)[2:31]
+```
+
+## Punkt 1
+
+### Opis 
+
+Pierwszym punktem jest dopasowanie kopuł opisujących zależności między parami stacji s0 i s1, gdzie s0 to moja poprzednio wybrana stacja Korbielów. Kopuły to inne określenie dystrybuant wielowymiarowych, mających jednostajne rozkłady brzegowe. Kopuły mają ograniczoną ilość "typów" czyli nazw, które różnią się od siebie ilościa parametrów lub ich wartościami. Do ich estymacji tworze pętle iterującą po każdej stacji, wyznaczam wszystkie potrzebne informacje czyli nazwę wyznaczonej kopuły (metodą parametryczną tzw. par i nieparametryczną tzw. npar), współczynnik Kendalla (statystyka opisująca zależności dwóch zmiennych losowych) oraz zależności ekstremalne, które zostaną użyte później. Wszystkie informacje zapisuje w tabelce, którą poźniej łącze z informacjami o stacjach by móc zaprezentować wyniki na mapie.  
+
+### Dopasowanie kopuł
+
+```{r include=FALSE}
+df <- data.frame(matrix(ncol = 6, nrow = 0))  
+listazaleznosciemp <- list()
+listazaleznosciteo <- list()
+i=0
+```
+
+```{r include=FALSE}
+for (element in colnames(dane_x)[2:31]) {
+  x2 <- na.omit(maxima_dobowe(dane[, element]))
+  f2<-fitDist(x2,type="realline")
+  
+  f<-function(x) do.call(paste0("p", f2$family[1]), c(list(x), f2[f2$parameters]))
+  
+  U <- cbind(pSEP4(x1, mu= 12.24065, sigma=15.03397, nu=3.024083, tau=4.520097),
+             f(x2))
+  colnames(U) <- c("U1","U2")
+  head(U)
+  
+  X <- matrix(c(x1,x2), nrow=5844, ncol=2)
+  V <- pobs(X)
+  colnames(V) <- c("V1","V2")
+  
+  cop.par <- BiCopSelect(U[,1],U[,2])      
+  cop.npar <- BiCopSelect(V[,1],V[,2]) 
+  cop.par; cop.npar
+  
+  new_row <- c(colnames(dane_x)[i+2], 
+               cop.npar$familyname,
+               cop.par$familyname,
+               mean(sapply(list(X=X, V=V),function(x) cor(x, method="kendall", use = "pairwise.complete.obs")[1,2])),
+               mean(sapply(list(U=U, X=X),function(x) cor(x, method="kendall", use = "pairwise.complete.obs")[1,2])))  
+  df <- rbind(df, new_row)
+  
+  listazaleznosciemp[1+i]<-fitLambda(na.omit(U), p = 0.01)[2,1]
+  listazaleznosciemp[31+i]<-fitLambda(na.omit(U), p = 0.01, lower.tail = FALSE)[2,1]
+  listazaleznosciemp[61+i]<-fitLambda(na.omit(V), p = 0.01)[2,1]
+  listazaleznosciemp[91+i]<-fitLambda(na.omit(V), p = 0.01, lower.tail = FALSE)[2,1]
+  listazaleznosciteo[1+i]<-BiCopPar2TailDep(cop.npar)$lower
+  listazaleznosciteo[31+i]<-BiCopPar2TailDep(cop.npar)$upper
+  listazaleznosciteo[61+i]<-BiCopPar2TailDep(cop.par)$lower
+  listazaleznosciteo[91+i]<-BiCopPar2TailDep(cop.par)$upper
+  
+  i=i+1}
+```
+
+Tabelka z danymi po operacji pętli prezentuje się następująco:
+
+```{r echo=FALSE}
+colnames(df) <- c("ID","kopuła npar", "kopuła par", "Kendall npar", "Kendall par")
+df <- lapply(df, function(x) gsub("X", "", x))
+df<-as.data.frame(df)
+head(df, n=5)
+```
+
+Teraz połączę ją z danymi o stacjach na podstawie ich ID:
+
+```{r echo=FALSE}
+df <- merge(df, stacje, by = "ID")
+df <- df[, -c(6,8,11)]
+df$"Szerokość geograficzna" <- as.numeric(gsub(" ", "", df$"Szerokość geograficzna")) / 10000
+df$"Długość geograficzna"  <- as.numeric(gsub(" ", "", df$"Długość geograficzna" )) / 10000
+df$"Kendall.npar"  <- as.numeric(df$"Kendall.npar")
+df$"Kendall.par"  <- as.numeric(df$"Kendall.par")
+head(df, n=5)
+```
+
+```{r include=FALSE}
+operacja <- function(a, b) {
+  lon1 <- 49.3407
+  lat1 <- 19.2054
+  distance_km <- distGeo(c(lon1, lat1), c(a, b))
+  return(distance_km)}
+```
+
+### Mapy z wynikami
+
+Pierwsza jest mapa stacji z nazwami wyestymowanych kopuł metoda nieparametryczną:
+
+```{r echo=FALSE, warning=FALSE}
+poland <- map_data('world','poland')
+ggplot()+  geom_polygon(data=poland,
+                        aes(x = long, y = lat),
+                        fill="gray") +
+        geom_point(data = df, mapping = aes(x = df$"Długość geograficzna", y =df$"Szerokość geograficzna"), size = 5, color = "blue") +
+        geom_text(aes(label = df$"kopuła.npar", x = df$"Długość geograficzna", y =df$"Szerokość geograficzna"), vjust = -1, size=3)
+```
+
+Kolejna jest mapa stacji z nazwami wyestymowanych kopuł metoda parametryczną:
+
+```{r echo=FALSE, warning=FALSE}
+ggplot()+  geom_polygon(data=poland,
+                        aes(x = long, y = lat),
+                        fill="gray") +
+        geom_point(data = df, mapping = aes(x = df$"Długość geograficzna", y =df$"Szerokość geograficzna"), size = 5, color = "blue") +
+        geom_text(aes(label = df$"kopuła.par", x = df$"Długość geograficzna", y =df$"Szerokość geograficzna"), vjust = -1, size=3)
+```
+
+A trzecią mapą są stacje z wyestymowanym dla nich współczynnikiem Kendalla (uśrednionym z obu metod):
+
+```{r echo=FALSE, warning=FALSE}
+ggplot()+  geom_polygon(data=poland,
+                        aes(x = long, y = lat),
+                        fill="gray") +
+        geom_point(data = df, mapping = aes(x = df$"Długość geograficzna", y =df$"Szerokość geograficzna"), size = 5, color = "blue") +
+        geom_text(aes(label = round(rowMeans(df[,c('Kendall.npar', 'Kendall.par')]),3), x = df$"Długość geograficzna", y =df$"Szerokość geograficzna"), 
+                      vjust = -1, size=3)
+```
+
+### Opis najczęstszej kopuły
+
+Mogę teraz sprawdzić naczęściej występującą kopułe dla naszych stacji, dla podejścia parametrycznego i nieparametrycznego:
+
+```{r echo=FALSE}
+if (names(table(df$kopuła.par))[which.max(table(df$kopuła.par))]== names(table(df$kopuła.npar))[which.max(table(df$kopuła.npar))]){
+  print(paste0("Most occuring copula: ", names(table(df$kopuła.par))[which.max(table(df$kopuła.par))]))
+}else{
+    print("par:", names(table(df$kopuła.par))[which.max(table(df$kopuła.par))], "; npar:", names(table(df$kopuła.npar))[which.max(table(df$kopuła.npar))])
+}
+```
+
+Najczęsciej występującą kopułą dla obu podejść jest kopuła Franka. Jest to jedna z kopuł Archimedesa, oznacza symbolem $F_{\theta}^{Fr}$ oparta na rozkładzie dwuwymiarowym Gaussa, z pojedynczym parametrem $\theta$. Oba współczynniki zależności ekstremalnej dla tej kopuły są równe 0. W przypadku gdy $\theta$=0 to mamy szczególny przypadek, gdzie kopuła Franka pokrywa się z kopułą niezależności.
+
+### Analiza współczynnika Kendalla
+
+Mając wyliczony współczynnik Kendalla pozostało zrobić wykres jego zależności od odległości danej stacji od mojej oryginalnie wybranej. Wpierw uśrednie go z obu metod:
+
+```{r echo=FALSE}
+distance <- mapply(operacja, df$"Szerokość geograficzna", df$"Długość geograficzna")
+df$odległość <- distance/1000
+plot(df$odległość, rowMeans(df[,c('Kendall.npar', 'Kendall.par')], na.rm=TRUE), main = "Współczynnik Kendalla - uśredniony", 
+    xlab = "Odległość", ylab = "Wartość współczynnika", cex.main = 1)
+```
+
+Z wykresu nie wynika jednoznaczna korelacja tych zmiennych. Jedynie widać, że dla mniejszych odległości wariancja współczynnika Kendalla jest mniejsza i wszystkie wartości są blisko siebie. Zobaczmy czy tak samo będzie jak rozdzielimy wartości ze względu na podejście:
+
+```{r echo=FALSE}
+par(mfrow=c(2,1))
+plot(df$odległość, df$"Kendall.par", main = "Współczynnik Kendalla - podejście parametryczne", 
+    xlab = "Odległość", ylab = "Wartość współczynnika", cex.main = 1)
+plot(df$odległość, df$"Kendall.npar", main = "Współczynnik Kendalla - podejście nieparametryczne", 
+    xlab = "Odległość", ylab = "Wartość współczynnika", cex.main = 1)
+```
+
+Ponownie nie widać jakiejkolwiek zależności. Ponownie wariancja wydaje się być mniejsza dla bardzo małych odległości, jednak różnica wydaje się mniejsza niż przy uśrednionej wartości współczynnika Kendalla.
+
+## Punkt 2
+
+### Opis 
+
+Celem punktu drugiego jest wyestymowanie temperatury dla stacji najbliższej i najdalszej odległościowo od mojej wybranej stacji Korbielów, przy warunku, że w mojej stacji temperatura jest na poziomie 20 i 50 letniego poziomu zwrotu. By to zrobić ponownie dopasuje rozkład do mojej stacji, tym razem dla maksimów dobowych by mieć większą płynność obliczeń, następnie wyznacze poziomy zwrotu dla tych maximów i za pomocą kopuł wyznacze rozkłady warunkowe dla danych dwóch stacji i wyznacze dla nich te same kwantyle. 
+
+### Analiza
+
+```{r echo=FALSE}
+mojastacja <- na.omit(maxima_dobowe(dane$X249190440))
+najbstacja<- na.omit(maxima_dobowe(dane[[paste0("X", df$ID[which.min(df$odległość)])]]))
+najdstacja<- na.omit(maxima_dobowe(dane[[paste0("X", df$ID[which.max(df$odległość)])]]))
+len=min(length(mojastacja), length(najbstacja), length(najdstacja))
+```
+
+```{r echo=FALSE}
+lista<-list(najbstacja=najbstacja, najdstacja=najdstacja)
+średnie<- list()
+kwantyle<- list()
+```
+
+```{r include=FALSE}
+f1 <- fitDist(x1,type="realline")
+qaunt<-function(x) do.call(paste0("q", f1$family[1]), c(x, f1[f1$parameters]))
+```
+
+Rozkład dla maksimów dobowych to:
+
+```{r echo=FALSE}
+f1$family; f1$Allpar
+```
+
+Poziomy zwrotu mojej stacji przy użyciu maksimów blokowych wynoszą:
+
+```{r echo=FALSE}
+c(qaunt(1-1/(20*365)), qaunt(1-1/(50*365)))
+```
+
+Wyniki wychodzą dosyć wysokie, jednak należy pamiętać, że metoda z dopasowaniem rozkładu o ile najprostsza już poprzednio pokazała tendecje do zawyżania wyników. Jednak z powodu wygody i szybkości i tak zdecydowałem się jej użyć. Mając wyliczone poziomy zwrotu mojej stacji mogę sporządzić histogramy poziomów zwrotu dla pozostałych stacji:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+tytuly1<-c("Stacja Najbliższa", "Stacja Najdalsza")
+tytuly2<-c("Kwantyl 95", "Kwantyl 98")
+for (a in c(1,2)) {
+  x<-lista[[a]]
+  f2<-fitDist(x,type="realline")
+
+  d1<-function(x) do.call(paste0("p", f2$family[1]), c(list(x), f2[f2$parameters]))
+
+  U <- cbind(pSEP4(mojastacja, mu=12.24, sigma=2.71, nu=1.107, tau=1.509),
+            d1(x))
+  colnames(U) <- c("U1","U2")
+  copbpar <- BiCopSelect(U[,1],U[,2])
+  
+  X <- matrix(c(mojastacja,x), nrow=len, ncol=2)
+  Vb <- pobs(X)
+  colnames(Vb) <- c("V1","V2")
+  copbnpar <- BiCopSelect(Vb[,1],Vb[,2]) 
+  
+  war<-c(qaunt(1-1/(20*365)), qaunt(1-1/(50*365)))
+  
+  
+  k=0
+  for (element in war) {
+    F1 <- ecdf(mojastacja)
+    u1.npar <- F1(element)
+    u1.par <- pSEP4(element,mu=12.24,sigma=2.71,nu=1.107,tau=1.509)
+    
+    U1.npar <- rep(u1.npar,10000)         
+    U1.par <- rep(u1.par,10000)
+    U2 <- runif(10000,0,1)
+    
+    wi.npar <- BiCopHinv1(U1.npar,U2,copbnpar)
+    wi.par  <- BiCopHinv1(U1.par,U2,copbpar)
+    
+    x2cond.npar <- quantile(x,wi.npar)
+    d2<-function(x) do.call(paste0("q", f2$family[1]), c(list(x), f2[f2$parameters]))
+    x2cond.par <- d2(wi.par)
+    
+    średnie<-append(średnie, c(mean(x2cond.npar),mean(x2cond.par)))
+    if (k == 0) {
+      kwantyle<- append(kwantyle, c(quantile(x2cond.npar, 0.95), quantile(x2cond.par, 0.95)))
+    }
+    if (k == 1) {
+      kwantyle<- append(kwantyle, c(quantile(x2cond.npar, 0.98), quantile(x2cond.par, 0.98)))
+    }
+    
+    par(mfrow=c(3,1))
+    hist(x,prob=TRUE,main = paste(tytuly1[a], tytuly2[k+1], sep=" - "),xlab="Temperatura", ylab="Gęstość")
+    hist(x2cond.npar,prob=TRUE,main ="Metoda npar",xlab="Temperatura", ylab="Gęstość")
+    hist(x2cond.par,prob=TRUE,main ="Metoda par",xlab="Temperatura", ylab="Gęstość")
+    k=k+1
+  }
+}
+```
+
+Dla najbliższej stacji poziomy zwrotu wynoszą:\
+-metodą nieparametryczną
+
+```{r echo=FALSE}
+kwantyle[1]; kwantyle[3]
+```
+
+-metodą parametryczną
+
+```{r echo=FALSE}
+kwantyle[2]; kwantyle[4]
+```
+    
+Dla najdalszej stacji poziomy zwrotu wynoszą:\
+-metodą nieparametryczną
+
+```{r echo=FALSE}
+kwantyle[5]; kwantyle[7]
+```
+
+-metodą parametryczną
+
+```{r echo=FALSE}
+kwantyle[6]; kwantyle[8]
+```
+
+## Punkt 3
+
+### Opis 
+
+Trzeci punkt polega na wyestymowaniu współczynników zależności ekstremalnej dla naszych dobranych kopuł, a następnie porównanie ich na wykresie z zależnościami teoretycznymi dla danych typów kopuł. Wszystkie te współczynniki zostały policzone i zapisane przy okazji punktu 1 i dopasowywania kopuł, zatem pozostało jedynie wyświetlić je na wykresie.
+
+### Analiza
+
+Wykresy współczynników zależności ekstremalnej:
+
+```{r echo=FALSE}
+par(mfrow=c(2,2))
+plot(listazaleznosciemp[c(1:30)], listazaleznosciteo[c(1:30)], main = "Nieparametryczny dolny", 
+    xlab = "Wartości empiryczne", ylab = "Wartości teoretyczne", cex.main = 1)
+plot(listazaleznosciemp[c(31:60)], listazaleznosciteo[c(31:60)], main = "Nieparametryczny górny", 
+    xlab = "Wartości empiryczne", ylab = "Wartości teoretyczne", cex.main = 1) 
+plot(listazaleznosciemp[c(61:90)], listazaleznosciteo[c(61:90)], main = "Parametryczny dolny", 
+    xlab = "Wartości empiryczne", ylab = "Wartości teoretyczne", cex.main = 1)
+plot(listazaleznosciemp[c(91:120)], listazaleznosciteo[c(91:120)], main = "Parametryczny górny", 
+    xlab = "Wartości empiryczne", ylab = "Wartości teoretyczne", cex.main = 1) 
+title("Współczynniki zależności ekstremalnej", line = -0.67, outer = TRUE)
+```
+
+Wszystkie górne zależności teoretyczne są równe zero, jednak widać że z danych empirycznych były przypadki gdzie wychodziły wartości nieznacznie większe od zera. Dla dolnych zależności pojawiły się pojedyncze przypadki gdzie ich wartość nie powinna być zerem. Ponownie widać, że dane empiryczne dawały błędne niezerowe wyniki w niektórych przypadkach, i to większe niż w przypadku górnych zależności. 
+
+# Część trzecia
+
+```{r include=FALSE}
+set.seed(5)
+```
+
+## Opis
+
+Trzecia część projektu skupia się już nie na pojedynczej zmiennej, jaką jest temperatura powietrza, ale na czterech zmiennych i modelowaniu ich rozkładu wielowymiarowego jak i dopasowaniu do nich modelu regresji kwantylowej. Oba te kroki bazują na strukturach R-vine, czyli strukturach stworzonych z dwuwymariowych kopuł służących do utworzenia rozkładu wielowymarowego. Zatem moim pierwszym celem będzie dopasowanie po jednej ze struktur C-vine i D-vine do danych oraz krótkie opisanie ich. Nastepnie znajde strukture najlepiej opisującą moje dane, i na tej podstawie przeprowadzę regresje kwantylową dla moich zmiennych i stworze model predykcyjny operujący na kwantylach z danych. Regresje przeprowadze tworząc dwa modele: jeden metodą parametryczną i drugi nieparametryczną, a następnie porównam oba te modele ze sobą i zobaczę jakie wnioski o zależnościach między moimi zmiennymi z nich wynikają
+
+## Analiza
+
+### Data preprocessing
+
+```{r warning=FALSE, include=FALSE}
+path<-"C:/Users/winal/Desktop/r-proj 3"
+setwd(path)
+```
+
+Pierwszym krokiem jest ponowne przygotowanie sobie maksimów dobowych, by mieć większa płynność w obliczeniach. Skorzystam już z tabelki stworzonej w części drugiej z maksimami dobowymi temperatur dla mojej stacji:
+
+```{r echo=FALSE}
+head(mojastacjamaxdob)
+```
+
+A następnie do tej tabeli dodam na podstawie daty wszystkie pozostałe zmienne, również w postaci maksimów dobowych:
+
+```{r echo=FALSE, warning=FALSE}
+for (i in c("out1", "out2", "out3")){
+dane1<-read.csv(paste(path, "/", i ,".csv", sep = ""))
+dane1 <- dane1 %>% filter(minute(data) %% 10 == 0)
+ms <- separate(dane1,data,c("year","mth","day"), convert=TRUE)
+dane1$data <- paste(ms$year,ms$mth, ms$day, sep="-")
+distinct_df = dane1 %>% distinct(data)
+stacja <- as.data.frame(maxima_dobowe(dane1$X249190440), row.names=distinct_df$data)
+stacja <- tibble::rownames_to_column(stacja, "data")
+colnames(stacja)[colnames(stacja) == "maxima_dobowe(dane1$X249190440)"] <- paste("wartosci", i, sep="_")
+mojastacjamaxdob <- merge(mojastacjamaxdob, stacja, by = "data")}
+
+mojastacja<-mojastacjamaxdob
+colnames(mojastacja) <- c("Data", "Temperatura_powietrza", "Średnia_prędkość_wiatru", "Suma_opadów", "Temperatura_gruntu")
+rm(distinct_df, mojastacja1)
+summary(mojastacja)
+```
+
+Widze, że w każdej z tabel występują wartości NA, które zaburzą dalsze analizy, zatem od razu się ich pozbęde:
+
+```{r echo=FALSE}
+mojastacja<-mojastacja[complete.cases(mojastacja),]
+summary(mojastacja)
+```
+
+Kolejną obserwacją jest bardzo dziwne maksimum dla temperatury gruntu. Jest to niemożliwe by temperatura, podawana tutaj w stopniach cesjusza była aż tak wysoka. Jeżeli przyjrzeć się tej wartości w tej kolumnie posortowanych malejąco: 
+
+```{r echo=FALSE}
+print("Wartości Temperatury gruntu")
+head(sort(mojastacja$Temperatura_gruntu, decreasing =TRUE),n=50)
+```
+
+To widać, że wartości w obrębie 30-40 stopni są dosyć pospolite i bardzo stopniowo maleją. Pozostałe wartości wydają mi się być dziwne, zwłaszcza gdy przyrówna się je z temperaturą powietrza (jeżeli temperatura gruntu to 40 stopni to temperatura powietrza również jest wysoka, co zgadza się z logiczną korelacją tych wartości, a gdy przyjrzeć się wartościom 60+ to już temperatura powietrza przyjmuje najróżniejsze wartości,w tym ujemne). Z tych też powodów usunę wszystkie wartości temperatury gruntu powyżej 50:
+
+```{r echo=FALSE}
+mojastacja <- mojastacja[mojastacja$Temperatura_gruntu <= 50, ]
+summary(mojastacja)
+```
+
+Mając już odpowiednio przygotowane dane mogę jeszcze nanieść je na wykresy punktowe/histogramy i zobaczyć ich współczynnik korelacji:
+
+```{r echo=FALSE}
+psych::pairs.panels(mojastacja[-c(1)])
+```
+
+Histogramy są ładne, jedynie specyficznie wygląda ten dla sumy opadów, gdzie dominuje wartość 0. Nie przejmuje się tym jednak, gdyż większość dni w roku faktycznie jest raczej bezdeszczowa. Współczynnik korelacji faktycznie potwierdza dużą zależność między temperaturami gruntu i powietrza, podczas gdy reszta zmiennych wydaję się być zdecydowanie słabiej skorelowana ze sobą. 
+
+### Struktury C-vine i D-vine
+
+Pierwszym krokiem do stworzenia struktur vine jest stworzenie pseudoobserwacji z naszych danych. Metoda tworzenia jest dowolna, zatem ja korzystam z tej prostszej, nieparametycznej wersji:
+
+```{r echo=FALSE}
+data <- mojastacja[-c(1)]
+data <- data.frame(lapply(data, function(x) as.numeric(as.character(x))))
+data <- data[complete.cases(data),]
+U <- data.frame(lapply(data, pobs))
+head(U)
+```
+
+Do utworzenia struktur typu vine potrzebujemy odpowiedniej macierzy, która określa budowę tej struktury i definiuje połączenia między zmiennymi. Struktura C-vine to struktura opierająca się na jednej danej tzw. "korzeniu" (ang. root) i połączeniu reszty zmiennych z nią. Struktura D-vine z kolei opiera się na liniowym połączeniu zmiennych, ale bez żadnych cykli (dla przykładowych struktur będą pokazane grafy które lepiej ilustrują te zasady). Macierzy odpowiednich dla danej struktury jest więcej niż 1, i mają określone zasady, które spełniają powyższe warunki. Jednak ja nie chce tutaj dawać wzorów na nie, więc po prostu wezme po jednej przykładowej macierzy dla każdej ze struktur, a później wyświetle macierz dla najlepiej dopasowanej struktury.
+
+Wpierw zajmę się utworzeniem struktury C-vine, dla której przykładowa macierzy wygląda tak:
+
+```{r echo=FALSE}
+MatrixCVine <- matrix(c(1, 0, 0, 0, 
+            2, 2, 0, 0,
+            3, 3, 3, 0,
+            4, 4, 4, 4),4,4,byrow=TRUE, dimnames = list(c("1.","2.","3.", "4."), c("1.","2.","3.", "4.")))
+MatrixCVine
+```
+
+```{r include=FALSE}
+Cvine <- RVineCopSelect(U, family = NA,
+                         Matrix = MatrixCVine,
+                         selectioncrit = 'AIC',
+                         method = 'mle',
+                         rotations = TRUE)
+```
+
+Mając już macierz i pseudoobserwacje mogę dopasować za pomocą funkcji RVineCopSelect kopuły, które utworzą mi strukture C-vine. Dobierze mi to najlepszą strukture przy użyciu estymatora najwiekszej wiarygodności i kryterium AIC. Budowę struktur vine można przedstawić za pomocą grafów, w których wierzchołkami są danea krawędziami kopuły dwuwymariowe dopasowane do danych z wierzchołkow krawędzi. Mój dobrany C-vine wygląda tak:
+
+```{r echo=FALSE}
+par(mfrow=c(1,3))
+plot(Cvine,edge.labels = "family-tau" ,cex=3)
+```
+
+Widać, że zmienna 4 pełni właśnie funkcje korzenia połącznego z każdą zmienną. Oprócz grafu można też sporządzić tabele zawierającą więcej szczegółów o naszej strukturze:
+
+```{r echo=FALSE}
+summary(Cvine)
+```
+
+Jest to jednak mniej czytelna reprezentacja tej struktury.
+
+Teraz tworzę drugą strukture, tak zwany D-vine. Ponownie wpierw należy przygotować macierz odpowiednią dla struktury tego typu. W moim przypadku użyje macierzy:
+
+```{r echo=FALSE}
+MatrixDVine <- matrix(c(4, 0, 0, 0,
+                        1, 3, 0, 0,
+                        2, 1, 2, 0,
+                        3, 2, 1, 1),4,4,byrow=TRUE, dimnames = list(c("1.","2.","3.", "4."), c("1.","2.","3.", "4.")))
+MatrixDVine
+```
+
+```{r include=FALSE}
+Dvine <- RVineCopSelect(U, family = NA,
+                         Matrix = MatrixDVine,
+                         selectioncrit = 'AIC',
+                         method = 'mle',
+                         rotations = TRUE)
+```
+
+Ponownie mając macierz nie pozostaje nic innego jak dopasować strukturę do naszych pseudoobserwacji z danych. Graf dla przykładowego D-vine prezentuje się tak:
+
+```{r echo=FALSE}
+par(mfrow=c(1,3))
+plot(Dvine,edge.labels = "family-tau" ,cex=3)
+```
+
+Ponownie pierwszy graf ładnie prezentuje liniowość o której wspominałem wyżej. Jeszcze pozostaje pokazać tabela ze szczegółami o kopułach dla D-vine:
+
+```{r echo=FALSE}
+summary(Dvine)
+```
+
+Po budowie grafów widać jasno różnice między tymi strukturami. Co więcej, kopuły dobrane między zmiennymi również się różnią dla obu tych przykładów, co jest naturalną konsekwencją ich różnej budowy, a co za tym idzie, innej kolejności zmiennych. 
+
+### Porównanie przykładowych struktur
+
+Najlepszym porównaniem dla obu struktur będzie wyświetlenie kryterium AIC, na podstawie którego ocenimy, który model jest lepiej dopasowany:
+
+```{r echo=FALSE}
+print("Struktura C-vine")
+print(paste("AIC =", Cvine$AIC))
+print_empty_line()
+print("Struktura D-vine")
+print(paste("AIC =", Dvine$AIC))
+```
+
+Jak widać przykładowa struktua C-vine jest lepiej dopasowana, gdyż ma mniejszą wartości kryterium AIC. Żeby bardziej szczegółowo porównać obie te struktury przyjrzę się dokładniej kopułom z których się składają. Jednak zamiast robić to za pomocą wcześniej prezentowanych tabel, mogę narysować ich wykresy konturowe:
+
+```{r echo=FALSE}
+par(mfrow=c(2,1))
+contour(Cvine)
+print_empty_line()
+contour(Dvine)
+```
+
+Porównując obie te figury, można dostrzec że kształty kopół odpowiadają sobie w tych strukturach, tylko zmieniają miejsce, czyli zmienne jakie modelują. 
+
+### Dobór najlepszej struktury
+
+By dobrać najlepszą strukture Vine dla naszych danych, skorzystam z funkcji RVineStructureSelect, która mi ją dobierze na podstawie wybranego kryterium porównawczego, w moim przypadku będzie to kryterium AIC:
+
+```{r echo=FALSE}
+RVM <- RVineStructureSelect(U, selectioncrit = "AIC")
+RVM$type; RVM$Matrix
+```
+
+Według tej funkcji najlepiej dopasowaną strukturą jest sturktura D-vine z powyższą macierzą, chociaż różnica w porównaniu z przykładowym modelem C-vine jest minimalna. Możemy się upewnić czy jest faktycznie najlepsza, dopasowując jak wyżej strukture Vine zadaną przez tą macierz:
+
+```{r echo=FALSE}
+BestVine <- RVineCopSelect(U, family = NA,
+                         Matrix = RVM$Matrix,
+                         selectioncrit = 'AIC',
+                         method = 'mle',
+                         rotations = TRUE)
+print(paste("Best DVine AIC value:", BestVine$AIC))
+```
+
+Faktycznie jest to struktura o najmniejszym kryterium AIC. Możemy jeszcze dla zasady zobaczyć jej tabelę z kopułami oraz ich wykresy konturowe:
+
+```{r echo=FALSE}
+summary(BestVine)
+print_empty_line()
+contour(BestVine)
+```
+
+Jak widać kształy ponownie są analogiczne, tylko znów porozrzucane w innych miejscach. 
+
+### Regresja kwantylowa
+
+
+Ponieważ z punktu wyżej wynikło, że najlepszą sturkturą jest struktura D-vine to operować będe na funkcji vinereg, która dopasowuje do moich danych model regresji kwantylowej ekskluzywnie ze strukturami D-vine. Pierwszym krokiem jest dopasowanie modelu, podanie mu zmiennych predykcyjnych (x) oraz zmiennej objaśnianej (y). Cały projekt skupia się na analizach wokół temperatury, więc to ona będzie tutaj zmienną objasnianą przez pozostałe zmienne wprowadzone w tej części. Zatem dopasowuje model parametryczny i patrze, które zmienne mają w nim największy wpływ na wartość temperatury powietrza: 
+
+```{r echo=FALSE}
+fit_vine_par <- vinereg(
+  Temperatura_powietrza ~ Temperatura_gruntu + Średnia_prędkość_wiatru + Suma_opadów ,
+  data = mojastacja,
+  family="parametric",
+  selcrit = "aic")
+print("Zmienne w kolejności z największym wpływem na zmienną objaśnianą:")
+fit_vine_par$order
+```
+
+Czyli zmienną najmocniej wpływającą na wartość temperatury jest temperatura gruntu, a najmniej wpływa średnia prędkośc wiatru. Zgadza się to z intuicyjnym myśleniem na temat tych zmiennych, jak i z wspołczynnikami korelacji wyświetlonymi przy obrabianiu danych. Ponieważ regresja kwantylowa z pakietu vinereg opiera się na strukturach D-vine, mogę ponownie przyjrzeć się ich budowie w postaci tabeli: 
+
+```{r echo=FALSE}
+summary(fit_vine_par$vine)
+```
+
+Oraz spojrzeć na wykresy koturowe kopuł między danymi:
+
+```{r echo=FALSE}
+contour(fit_vine_par$vine)
+```
+
+Ponownie mamy do czynienia z bardzo podobnymi kształtami co w poprzednich dopasowanych Vine'ach. Tym razem jednak jest to model regresji kwantylowej, który pozwala mi przewidywać kwantyle temperatury powietrza na podstawie wartości pozostałych zmiennych. Stwórzmy więc wartości predykcje modelu dla trzech rzędów kwantyli: 0.1, 0.5 i 0.9:
+
+```{r echo=FALSE}
+alpha_vec <- c(0.1, 0.5, 0.9)
+pred_vine_par <- fitted(fit_vine_par, alpha = alpha_vec)
+head(pred_vine_par)
+```
+
+Mając już nasze predykcje możemy je nanieść na wykres i zobaczyć zależności pomiędzy prawdziwymi kwantylami a tymi wyestymowanymi:
+
+```{r echo=FALSE}
+plot_effects(fit_vine_par)
+```
+
+Kształty wykresów mogą początkowo wydawać się dziwne, ale są one odpowiednie do rodzajów danych jakie tu wziąłem. Dogłębniejszą analize wykresów zrobie przy podsumowaniu porównując wykresy modelu parametrycznego z nieparametrycznym.
+
+Teraz powtórze wszystkie poprzednie kroki, tylko że dla modelu nieparametrycznego. Wpierw kolejno zmienne z największym wpływem na zmienną objaśnianą:
+
+```{r echo=FALSE}
+fit_vine_npar <- vinereg(
+  Temperatura_powietrza ~  Temperatura_gruntu + Średnia_prędkość_wiatru + Suma_opadów,
+  data = mojastacja,
+  family_set = "nonpar",
+  selcrit = "aic")
+print("Zmienne w kolejności z największym wpływem:")
+fit_vine_npar$order
+```
+
+Już tutaj jest zmiana w porównaniu do modelu parametrycznego - najbardziej wpływową zmienną w tym modelu jest suma opadów, a najmniej wpływową ponownie średnia prędkość wiatru. Dalej struktura vine dla modelu: 
+
+```{r echo=FALSE}
+summary(fit_vine_npar$vine)
+```
+
+Widać, że niektóre kolumny różnią się strukturą względem modelu parametrycznego, co nie powinno dziwić gdyż stosujemy tutaj zupełnie inne podejście. Co ciekawsze jest fakt, że każda z kopuł tutaj wyszłą tego samego typu: typu tll. Wykresy konturowe powyższych kopuł:
+
+```{r echo=FALSE}
+contour(fit_vine_npar$vine)
+```
+
+Na pierwszy rzut oka znowu widać to samo co poprzednio: podobne kształy tylko w innych kratkach ze zmeinnymi, jednak można spostrzec że wiele z kopuł tutaj jest o wiele mniej okrągłych i są bardziej nieregularne niż te parametryczne. Zobaczmy czy na wykresie zależności również da się dostrzec jakieś zmiany. Wpierw predykcje nieparametrycznego modelu:
+
+```{r echo=FALSE}
+alpha_vec <- c(0.1, 0.5, 0.9)
+pred_vine_npar <- fitted(fit_vine_npar, alpha = alpha_vec)
+head(pred_vine_npar)
+```
+
+I wykres zależności tych predykcji:
+
+```{r echo=FALSE}
+plot_effects(fit_vine_npar)
+```
+
+Znów, na pierwszy rzut oka tak zwany różnice ciężko dostrzec. Dopiero jak się zestawi wykresy obu modeli obok siebie, można dostrzec pewne różnice, o których rozpisze się niżej w porównaniu.
+
+### Porównanie i wnioski
+
+Pierwszą rzeczą będzie porównanie i ocena modeli, na podstawie kryterium AIC:
+
+```{r echo=FALSE}
+print("Metoda parametyczna")
+print(paste("AIC =", fit_vine_par$stats$caic))
+print_empty_line()
+print("Metoda nieparametyczna")
+print(paste("AIC =", fit_vine_npar$stats$caic))
+```
+
+Kryterium jest mniejsze dla modelu nieparametrycznego, zatem go traktuje jako lepiej dopasowany model. Następnie moge zrobić bezpośrednie porównanie predykcji wartości modelu parametrynczego i nieparametrycznego, oraz sprawdzić ich różnice na histogramie:
+
+```{r echo=FALSE}
+par(mfrow=c(2,3))
+for(i in 1:3){plot(pred_vine_par[,i],pred_vine_npar[,i],pch=19)
+  abline(a=0,b=1,col=2,lwd=2)
+  grid()}
+for(i in 1:3){hist(pred_vine_par[,i]-pred_vine_npar[,i],prob=TRUE)}
+```
+
+Z obu typów wykresu dla każdej zmiennej wynika, że predykcje metody parametrycznej zdają się mieć lekko większe wartości, ale różnica nie jest znacząca. Czyli skoro jest to model z większa wartością kryterium AIC, to możemy wnioskować, że model parametryczny przeszacowuje wartości temperatury, którym bliżej do predykcji modelu nieparametrycznego. Ostatnim porównaniem, z którego będe wnioskować to zestawienie wykresów zależności dla predykcji kwantyli zmiennych:
+
+```{r echo=FALSE}
+par(mfrow=c(2,3))
+plot_effects(fit_vine_par)
+plot_effects(fit_vine_npar)
+```
+
+Wykresy dla obu modeli prezentują się dosyć podobnie. Oba modele prezentują liniową zależność między temperaturą gruntu a naszą zmienną objaśnianą czyli temperaturą powietrza. Jest to satysfakcjonujący wynik, gdyż faktycznie te zmienne powinny być mocno i liniowo skorelowane. W przypadku pozostałych dwóch zmiennych ich korelacja z temperaturą powietrza jest widocznie nieliniowa. Suma opadów zdaje się mieć wpływ na wartości temperatury, co też zgadza się z logiką, gdyż deszcz często obniża temperature, podczas gdy zależność średniej prędkości wiatru i temperatury zdaje się być dosyć losowa. Zauważalny jest również większy rozstrzał danych i predykcji dla modelu parametrycznego, który może tłumaczyć dlaczego kryterium AIC pokazało go jako gorzej dopasowany model. Zatem można stwierdzić, że jeden typ kopuły występujący w modelu nieparametrycznym oraz jej mniej regularne kształty lepiej dopasowały się do moich danych i dały odrobine lepsze predykcje. 
